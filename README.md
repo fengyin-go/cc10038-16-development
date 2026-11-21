@@ -11,12 +11,15 @@
 .
 ├── frontend/                 Vue 3 + Vite + TypeScript 前端
 │   ├── src/views/WorkbenchView.vue|tsx  全部模块共享工作台
+│   ├── src/views/ParserReleaseView.vue  解析发布门槛工作台
 │   ├── src/data/modules.ts              18个业务模块配置
 │   ├── src/api/              统一请求封装
 │   └── vite.config.ts        dev server 配置（open: false）
 ├── backend/                  FastAPI（Python） 后端
 │   ├── app/routers/resource.py  通用查询/导出/登记/动作接口
+│   ├── app/routers/parser_router.py  解析发布门槛接口
 │   ├── app/services/<key>.py    每个模块独立领域逻辑
+│   ├── app/services/parser_release.py  试解析、发布清单与版本门槛
 │   ├── app/services/base.py     共享服务骨架
 │   └── app/store.py          内存数据仓库与示例数据
 ├── .gitignore
@@ -78,6 +81,28 @@ npm run dev
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+
+## 解析发布门槛
+
+字段解析规则不再“填完就能发布”：必须先按来源格式试解析样本，用质量规则判定候选能否生效。
+
+- 样本：`POST /api/parser/samples` 登记，按 `来源标识 + 输入格式` 保存带期望字段的原始日志。
+- 候选：`POST /api/parser/candidates` 声明有意纳入的格式、每格式字段映射和必填字段，
+  规则定义支持 `delimited:<分隔符>`、`json`、`kv` 解析引擎和 `字段映射`。
+- 试解析：`POST /api/parser/candidates/{id}/trial` 逐格式解析样本，计算缺字段率/错列率，
+  阈值来自 `quality_check` 里 `校验类型` 为缺字段率/错列率的已生效规则（可限定来源/格式）。
+- 发布：`POST /api/parser/candidates/{id}/publish?simulate_interrupt=true` 只发布合格格式；
+  清单先暂存规则再原子提交，中断时清单不生效，用
+  `POST /api/parser/manifests/{清单编号}/resume` 从断点恢复。
+- 资格：`GET /api/parser/sources/{来源}/formats` 返回每个格式的判定条件、质量结果和可生产资格。
+- 重算：`POST /api/parser/thresholds` 变更阈值后按新口径重算已试验样本，并同步清单可用范围；
+  阈值放宽不会让发布时被拒绝的格式自动获得生产资格。
+- 版本：`GET /api/parser/rule-versions` 与 `GET /api/parser/records?rule_version=` 可按原版本回查；
+  `GET /api/parser/sources/{来源}/stats` 给出同源合计使用了哪几套规则。
+- 生产解析：批次启动时固定当前生效清单映射；合格格式按清单规则版本解析，
+  不合格格式直接判解析失败并写明原因，不会切换映射。
+
+前端入口：`/parser-release`。
 
 领域：数据工程
 子方向：数据采集、爬虫与RPA

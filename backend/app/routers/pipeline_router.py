@@ -21,6 +21,7 @@ class IngestBatchPayload(BaseModel):
     source_id: str = Field(..., min_length=1)
     time_window: str = Field(..., min_length=1)
     raw_logs: list[dict[str, Any]] = Field(default_factory=list)
+    default_format: str | None = None
 
 
 class ParseBatchPayload(BaseModel):
@@ -70,6 +71,7 @@ class FullPipelinePayload(BaseModel):
     time_window: str = Field(..., min_length=1)
     raw_logs: list[dict[str, Any]] = Field(default_factory=list)
     parser_rule: str | None = None
+    default_format: str | None = None
 
 
 @router.post("/source/register")
@@ -84,7 +86,8 @@ def pipeline_validate_source(source_id: str = Query(..., min_length=1)) -> dict[
 
 @router.post("/batch/start")
 def pipeline_start_batch(payload: IngestBatchPayload) -> dict[str, Any]:
-    return pipeline.start_ingest_batch(payload.source_id, payload.time_window, payload.raw_logs)
+    return pipeline.start_ingest_batch(
+        payload.source_id, payload.time_window, payload.raw_logs, payload.default_format)
 
 
 @router.post("/batch/parse")
@@ -139,7 +142,8 @@ def pipeline_evolve_schema(payload: SchemaEvolvePayload) -> dict[str, Any]:
 @router.post("/full")
 def pipeline_run_full(payload: FullPipelinePayload) -> dict[str, Any]:
     return pipeline.run_full_pipeline(
-        payload.source_id, payload.time_window, payload.raw_logs, payload.parser_rule
+        payload.source_id, payload.time_window, payload.raw_logs,
+        payload.parser_rule, payload.default_format
     )
 
 

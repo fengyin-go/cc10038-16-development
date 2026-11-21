@@ -11,6 +11,7 @@ import time
 from typing import Any
 
 from app.store import store
+from app.services import parser_release
 
 
 def _now_iso() -> str:
@@ -69,8 +70,13 @@ class IngestPipeline:
         source_id: str,
         time_window: str,
         raw_logs: list[dict[str, Any]] | None = None,
+        default_format: str | None = None,
     ) -> dict[str, Any]:
-        """启动采集批次：登记批次并为其生成原始日志记录。"""
+        """启动采集批次：登记批次并为其生成原始日志记录。
+
+        每条原始记录在入库时就标注输入格式；如果没有显式给出，则使用数据源登记
+        的默认格式。格式一旦写入原始记录，后续解析不再猜测。
+        """
         sources = store.rows("source_registry")
         source_entry = None
         for s in sources:
@@ -88,6 +94,7 @@ class IngestPipeline:
             if b.get("所属数据源") == source_id and b.get("status") in ("待采集", "采集中"):
                 return {"ok": False, "message": f"数据源 {source_id} 已有进行中的批次 {b.get('批次编号')}", "batch": b}
 
+        fallback_format = default_format or source_entry.get("默认格式")
         batch_no = f"INGE-{_next_id('ingest_batch'):04d}"
         batch_entry = {
             "id": _next_id("ingest_batch"),
@@ -103,6 +110,14 @@ class IngestPipeline:
             "source_version": source_entry.get("source_version", 1),
             "started_at": _now_iso(),
         }
+        # 批次启动时固定当前生效的解析清单快照。批次进行中即使发布完成，
+        # 解析也继续使用这批快照，不会换错映射。
+        mapping = self._pin_mapping(source_id)
+        batch_entry["规则清单"] = mapping.get("清单编号")
+        batch_entry["解析映射"] = mapping.get("映射", {})
+        batch_entry["可生产格式"] = mapping.get("接受格式", [])
+        # 批次启动即固定映射；启动时若还没有生效清单，也不在解析中途接管新清单。
+        batch_entry["映射已固定"] = True
         batches.append(batch_entry)
 
         # 生成原始日志记录
@@ -123,6 +138,7 @@ class IngestPipeline:
                     "abnormal": False,
                     "batch_version": 1,
                     "source_id": source_id,
+                    "输入格式": log.get("format") or fallback_format or "",
                     "ingested_at": _now_iso(),
                 }
                 raw_records_list.append(record)
@@ -138,31 +154,91 @@ class IngestPipeline:
         }
 
     # ---------- 阶段2：字段解析 ----------
+    def _pin_mapping(self, source_id: str) -> dict[str, Any]:
+        """批次启动时快照当前生效清单的映射，后续发布不影响本批次。"""
+        manifest = parser_release.active_manifest(source_id)
+        if manifest is None:
+            return {"清单编号": None, "映射": {}, "接受格式": []}
+        mapping: dict[str, Any] = {}
+        for fmt, rule in (manifest.get("已发布规则") or {}).items():
+            mapping[fmt] = {
+                "规则名称": rule.get("规则名称"),
+                "规则版本": rule.get("规则版本"),
+                "输出字段列表": rule.get("输出字段列表"),
+                "解析引擎": rule.get("解析引擎"),
+                "字段映射": rule.get("字段映射") or {},
+                "规则集名称": manifest.get("规则集名称"),
+                "规则集版本": manifest.get("规则集版本"),
+                "清单编号": manifest.get("清单编号"),
+            }
+        return {
+            "清单编号": manifest.get("清单编号"),
+            "规则集名称": manifest.get("规则集名称"),
+            "规则集版本": manifest.get("规则集版本"),
+            "接受格式": list(manifest.get("接受格式") or []),
+            "映射": mapping,
+        }
+
+    def _explicit_rule(self, parser_rule_name: str | None) -> dict[str, Any] | None:
+        if not parser_rule_name:
+            return None
+        for rule in store.rows("field_parser"):
+            if rule.get("规则名称") == parser_rule_name:
+                return rule
+        return None
+
     def parse_batch(
         self,
         batch_no: str,
         parser_rule_name: str | None = None,
     ) -> dict[str, Any]:
-        """解析批次中的原始日志为标准化明细。"""
+        """解析批次中的原始日志为标准化明细。
+
+        规则按输入格式独立解析；批次启动时固定的清单快照决定用哪套规则版本。
+        未通过发布门槛的格式不会被任何规则解析，直接记为解析失败并说明原因。
+        """
         raw_records_list = store.rows("raw_records")
         batch_raw = [r for r in raw_records_list if r.get("批次编号") == batch_no]
         if not batch_raw:
             return {"ok": False, "message": f"批次 {batch_no} 无原始日志记录"}
 
-        # 查找匹配的解析规则
-        parsers = store.rows("field_parser")
-        rule = None
-        if parser_rule_name:
-            for p in parsers:
-                if p.get("规则名称") == parser_rule_name:
-                    rule = p
+        batch = None
+        for item in store.rows("ingest_batch"):
+            if item.get("批次编号") == batch_no:
+                batch = item
+                break
+
+        source_id = (
+            (batch or {}).get("所属数据源")
+            or next((r.get("source_id") for r in batch_raw if r.get("source_id")), None)
+        )
+        pinned = (batch or {}).get("解析映射") or {}
+        pinned_manifest = (batch or {}).get("规则清单")
+        explicit = self._explicit_rule(parser_rule_name)
+        if parser_rule_name and explicit is None:
+            return {"ok": False, "message": f"解析规则 {parser_rule_name} 不存在"}
+        if explicit is not None and explicit.get("status") not in ("已发布", "已弃用"):
+            # 草稿规则（包括发布暂存中的规则）不能直接用于生产解析。
+            return {"ok": False, "message": f"解析规则 {parser_rule_name} 尚未发布，不能用于生产解析"}
+
+        # 没有固定映射时保持历史行为：取一条已发布规则，按原方式解析。
+        # 已经纳入质量门槛管理的来源（有样本/候选/清单）不适用这条历史回退。
+        gate_enabled = parser_release.gate_enabled(str(source_id or ""))
+        legacy_rule = explicit
+        pin_locked = bool((batch or {}).get("映射已固定"))
+        if not pinned and not pin_locked:
+            active = parser_release.active_manifest(source_id) if source_id else None
+            if active is not None:
+                # 旧批次（没有固定映射标记）在解析前补一次快照；新批次启动时已固定，
+                # 不会再接管解析中途发布完成的清单。
+                pinned_manifest = active.get("清单编号")
+                pinned = self._pin_mapping(source_id)["映射"]
+        if legacy_rule is None and not pinned and not gate_enabled:
+            for rule in store.rows("field_parser"):
+                if rule.get("status") == "已发布":
+                    legacy_rule = rule
                     break
-        if rule is None:
-            for p in parsers:
-                if p.get("status") == "已发布":
-                    rule = p
-                    break
-        if rule is None:
+        if legacy_rule is None and not pinned and not pin_locked and not gate_enabled:
             return {"ok": False, "message": "无可用解析规则，请先发布一条字段解析规则"}
 
         # 获取当前 schema_version
@@ -178,25 +254,77 @@ class IngestPipeline:
         failure_count = 0
         parsed_ids: list[int] = []
         failed_ids: list[int] = []
+        format_rules: dict[str, dict[str, Any]] = {}
+        blocked_records: list[dict[str, Any]] = []
 
         for raw in batch_raw:
             raw_id = raw["id"]
+            fmt = str(raw.get("输入格式") or "")
+            record_source = str(raw.get("source_id") or source_id or "")
+
+            rule = pinned.get(fmt) if fmt else None
+            ineligible_reason = ""
+            if rule is None and fmt and pinned:
+                # 清单已固定，但该格式不在可生产范围内：明确阻断。
+                ineligible_reason = (
+                    f"格式 {fmt} 未通过发布清单 {pinned_manifest} 的质量门槛，"
+                    "不能用于该类生产日志"
+                )
+            elif rule is None and fmt and not pinned and gate_enabled:
+                # 来源已纳入门槛但还没有生效清单：不能借用任何已发布规则。
+                ineligible_reason = (
+                    f"来源 {source_id} 还没有生效的解析发布清单，"
+                    f"格式 {fmt} 不能用于生产日志"
+                )
+            elif rule is None and fmt and pinned_manifest is None and explicit is not None:
+                rule = {
+                    "规则名称": explicit.get("规则名称"),
+                    "规则版本": explicit.get("规则版本") or explicit.get("规则名称"),
+                    "输出字段列表": explicit.get("输出字段列表"),
+                    "解析引擎": explicit.get("解析引擎"),
+                    "字段映射": explicit.get("字段映射") or {},
+                    "规则集名称": explicit.get("规则集名称"),
+                    "规则集版本": explicit.get("规则集版本"),
+                    "清单编号": explicit.get("发布清单"),
+                }
+            elif rule is None and not fmt and pinned:
+                # 未标注格式的历史记录不能猜测映射。
+                ineligible_reason = "原始记录未标注输入格式，无法确定生产规则"
+
             try:
-                # 模拟字段解析：将原始正文按规则打散
-                body = raw.get("原始正文", "")
-                fields = self._parse_body(body, rule)
+                if ineligible_reason:
+                    raise ValueError(ineligible_reason)
+                if rule is not None:
+                    fields = parser_release.parse_body(raw.get("原始正文", ""), rule)
+                    rule_name = rule.get("规则名称", "unknown")
+                    rule_version = rule.get("规则版本") or rule_name
+                    rule_set_name = rule.get("规则集名称")
+                    rule_set_version = rule.get("规则集版本")
+                else:
+                    # 历史无版本规则：沿用原来的解析实现。
+                    fields = self._parse_body(raw.get("原始正文", ""), legacy_rule)
+                    rule_name = legacy_rule.get("规则名称", "unknown")
+                    rule_version = legacy_rule.get("规则版本") or rule_name
+                    rule_set_name = legacy_rule.get("规则集名称")
+                    rule_set_version = legacy_rule.get("规则集版本")
+
                 ent_id = _next_id("parsed_entity")
                 entity = {
                     "id": ent_id,
                     "来源批次": batch_no,
                     "原始记录ID": str(raw_id),
-                    "解析规则版本": rule.get("规则名称", "unknown"),
+                    "解析规则版本": rule_version,
                     "标准化字段集": json.dumps(fields, ensure_ascii=False),
                     "校验状态": "",
                     "status": "待校验",
                     "pending": True,
                     "abnormal": False,
-                    "parser_rule": rule.get("规则名称"),
+                    "parser_rule": rule_name,
+                    "来源标识": record_source,
+                    "输入格式": fmt,
+                    "规则集名称": rule_set_name,
+                    "规则集版本": rule_set_version,
+                    "解析清单": pinned_manifest,
                     "schema_version": schema_ver.get("版本号") if schema_ver else "v1.0",
                     "parsed_at": _now_iso(),
                     "content_digest": _stable_digest(fields),
@@ -205,14 +333,29 @@ class IngestPipeline:
                 raw["status"] = "已解析"
                 raw["pending"] = False
                 raw["解析状态"] = "已解析"
+                raw["解析规则版本"] = rule_version
                 success_count += 1
                 parsed_ids.append(ent_id)
-            except Exception:
+                bucket = format_rules.setdefault(fmt or "未标注格式", {
+                    "规则名称": rule_name,
+                    "规则版本": rule_version,
+                    "规则集名称": rule_set_name,
+                    "规则集版本": rule_set_version,
+                    "记录数": 0,
+                })
+                bucket["记录数"] += 1
+            except Exception as exc:
                 raw["status"] = "解析失败"
                 raw["解析状态"] = "解析失败"
                 raw["abnormal"] = True
+                raw["解析失败原因"] = str(exc)
                 failure_count += 1
                 failed_ids.append(raw_id)
+                blocked_records.append({
+                    "原始记录ID": str(raw_id),
+                    "输入格式": fmt,
+                    "原因": str(exc),
+                })
 
         # 更新批次状态
         batches = store.rows("ingest_batch")
@@ -223,6 +366,7 @@ class IngestPipeline:
                 b["abnormal"] = failure_count > 0
                 b["parsed_ids"] = json.dumps(parsed_ids)
                 b["batch_version"] = b.get("batch_version", 1) + 1
+                b["格式规则版本"] = format_rules
                 break
 
         # 记录解析日志
@@ -239,17 +383,20 @@ class IngestPipeline:
             "abnormal": failure_count > 0,
             "success_count": str(success_count),
             "failure_count": str(failure_count),
+            "解析清单": pinned_manifest,
+            "格式规则版本": format_rules,
         }
         journal.append(journal_entry)
 
         # 失败记录进入重试队列
         if failure_count > 0:
             retry_q = store.rows("retry_queue")
+            blocked_by_id = {item["原始记录ID"]: item["原因"] for item in blocked_records}
             for fid in failed_ids:
                 retry_entry = {
                     "id": _next_id("retry_queue"),
                     "失败记录ID": str(fid),
-                    "失败原因": "字段解析失败",
+                    "失败原因": blocked_by_id.get(str(fid), "字段解析失败"),
                     "重试次数": "0",
                     "最大重试": "3",
                     "下次重试时间": _now_iso(),
@@ -257,7 +404,8 @@ class IngestPipeline:
                     "pending": True,
                     "abnormal": False,
                     "batch_no": batch_no,
-                    "parser_rule": rule.get("规则名称"),
+                    "parser_rule": (legacy_rule or {}).get("规则名称"),
+                    "解析清单": pinned_manifest,
                 }
                 retry_q.append(retry_entry)
 
@@ -268,6 +416,9 @@ class IngestPipeline:
             "failure": failure_count,
             "parsed_ids": parsed_ids,
             "failed_ids": failed_ids,
+            "manifest": pinned_manifest,
+            "format_rules": format_rules,
+            "blocked_records": blocked_records,
         }
 
     def _parse_body(self, body: str, rule: dict[str, Any]) -> dict[str, Any]:
@@ -659,6 +810,7 @@ class IngestPipeline:
         time_window: str,
         raw_logs: list[dict[str, Any]],
         parser_rule: str | None = None,
+        default_format: str | None = None,
     ) -> dict[str, Any]:
         """执行完整采集 → 解析 → 去重 → 校验 → 聚合 → 导出的全链路。"""
         steps: dict[str, Any] = {}
@@ -671,7 +823,8 @@ class IngestPipeline:
         steps["source_registry"] = reg
 
         # S1: 启动采集批次
-        batch_result = self.start_ingest_batch(source_id, time_window, raw_logs)
+        batch_result = self.start_ingest_batch(
+            source_id, time_window, raw_logs, default_format)
         if not batch_result["ok"]:
             return {"ok": False, "message": batch_result["message"]}
         steps["ingest_batch"] = batch_result
